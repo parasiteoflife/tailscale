@@ -104,7 +104,7 @@ jobs:
           $env:CGO_ENABLED = "1"
           Write-Host "Downloading modules..."
           go mod tidy -v
-          go mod download -v
+          go mod download
 
       - name: Build binaries (Windows amd64)
         shell: powershell
