@@ -1,0 +1,132 @@
+name: Build and release for Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag / release name (e.g. v1.2.3). If empty, uses auto-<sha>"
+        required: false
+        default: ""
+      platforms:
+        description: "Comma-separated platforms to build. Default: windows/amd64"
+        required: false
+        default: "windows/amd64"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-build-and-release:
+    runs-on: windows-latest
+    env:
+      GO111MODULE: "on"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25"
+          cache: "true"
+
+      - name: Determine release tag
+        id: tag
+        shell: powershell
+        run: |
+          if ("${{ github.event.inputs.tag }}" -ne "") {
+            Write-Output "TAG=${{ github.event.inputs.tag }}" | Out-File -FilePath "$env:GITHUB_OUTPUT" -Encoding utf8 -Append
+          } else {
+            $short = $env:GITHUB_SHA.Substring(0,8)
+            Write-Output "TAG=auto-$short" | Out-File -FilePath "$env:GITHUB_OUTPUT" -Encoding utf8 -Append
+          }
+
+      - name: Prepare MSVC environment (vcvars)
+        id: vcvars
+        shell: powershell
+        run: |
+          Write-Host "Locating Visual Studio vcvars..."
+          $vswhere = "${Env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-Not (Test-Path $vswhere)) {
+            Write-Error "vswhere.exe not found at $vswhere; runner should have Visual Studio Build Tools installed."
+            exit 1
+          }
+          $inst = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $inst) {
+            Write-Error "No suitable Visual Studio installation found."
+            exit 1
+          }
+          $vcvars = Join-Path $inst "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path $vcvars)) {
+            $vcvars = Join-Path $inst "VC\Auxiliary\Build\vcvars64.bat"
+          }
+          if (-not (Test-Path $vcvars)) {
+            Write-Error "vcvars script not found under $inst"
+            exit 1
+          }
+          # Run vcvars and capture environment
+          & cmd /c "`"$vcvars`" && set" > env.txt
+          Write-Host "Captured VC environment to env.txt"
+
+      - name: Import VC environment & set Go env
+        shell: powershell
+        run: |
+          $lines = Get-Content env.txt
+          foreach ($l in $lines) {
+            if ($l -match "=") {
+              $parts = $l -split "=",2
+              # Set the vars in the current process
+              [System.Environment]::SetEnvironmentVariable($parts[0], $parts[1], "Process")
+            }
+          }
+          # sanity checks
+          Write-Host "cl.exe location:"
+          & where cl.exe || Write-Host "cl.exe not found in PATH"
+          go version
+          go env
+
+      - name: Download modules
+        shell: powershell
+        run: |
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          $env:CGO_ENABLED = "1"
+          # optional: set GOPROXY if you want explicit proxy
+          # $env:GOPROXY = "https://proxy.golang.org,direct"
+          Write-Host "Downloading modules..."
+          go mod tidy -v
+          go mod download -v
+
+      - name: Build binaries (Windows amd64)
+        shell: powershell
+        run: |
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          $env:CGO_ENABLED = "1"
+          # Build output directory
+          New-Item -ItemType Directory -Path out -Force | Out-Null
+          Write-Host "Building tailscaled.exe..."
+          go build -v -o out\tailscaled-windows-amd64.exe ./cmd/tailscaled
+          Write-Host "Building tailscale.exe..."
+          go build -v -o out\tailscale-windows-amd64.exe ./cmd/tailscale
+
+      - name: GH Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          body: |
+            Automated Windows build from commit ${{ github.sha }}.
+          files: |
+            out/tailscaled-windows-amd64.exe
+            out/tailscale-windows-amd64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts to workflow run
+        uses: actions/upload-artifact@v5
+        with:
+          name: windows-artifacts-${{ steps.tag.outputs.tag }}
+          path: out/*
